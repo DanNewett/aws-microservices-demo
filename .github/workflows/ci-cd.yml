@@ -1,0 +1,85 @@
+name: ci-cd
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+
+  SERVICE_NAME: aws-microservices-demo
+  ECR_REPO: aws-microservices-demo-repo
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy-dev:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Configure AWS via OIDC
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 2) Ensure ECR exists
+      - name: Ensure ECR repository exists
+        run: |
+          set -e
+          aws ecr describe-repositories --repository-names "$ECR_REPO" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-names "$ECR_REPO" >/dev/null
+          echo "ECR_URL=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}" >> $GITHUB_ENV
+
+      # 3) Login, build, push
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        run: |
+          docker build -t $ECR_URL:$IMAGE_TAG -t $ECR_URL:latest .
+          docker push $ECR_URL:$IMAGE_TAG
+          docker push $ECR_URL:latest
+
+      # 4) Terraform deploy
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: terraform/envs/dev
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_account_id: ${{ env.AWS_ACCOUNT_ID }}
+          TF_VAR_service_name: ${{ env.SERVICE_NAME }}
+          TF_VAR_image_tag: ${{ env.IMAGE_TAG }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: terraform/envs/dev
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_account_id: ${{ env.AWS_ACCOUNT_ID }}
+          TF_VAR_service_name: ${{ env.SERVICE_NAME }}
+          TF_VAR_image_tag: ${{ env.IMAGE_TAG }}
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        working-directory: terraform/envs/dev
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_account_id: ${{ env.AWS_ACCOUNT_ID }}
+          TF_VAR_service_name: ${{ env.SERVICE_NAME }}
+          TF_VAR_image_tag: ${{ env.IMAGE_TAG }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Output URL
+        id: outputs
+        working-directory: terraform/envs/dev
+        run: terraform output -raw url || true
